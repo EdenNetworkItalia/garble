@@ -1,0 +1,92 @@
+# reflect finds the types it can construct, such as []T for SliceOf, by a
+# binary search over the typelinks, comparing the type strings the runtime
+# returns. Those strings carry the original names of the reflected types, so
+# the linker must sort the typelinks by them too.
+exec garble build
+exec ./main
+stdout '^typelinks not found by reflect: 0$'
+
+exec garble -seed=c2VlZDAwMDE= build
+exec ./main
+stdout '^typelinks not found by reflect: 0$'
+
+[short] stop # no need to verify this with -short
+
+# Check that the program works as expected without garble.
+go build
+exec ./main
+stdout '^typelinks not found by reflect: 0$'
+-- go.mod --
+module test/main
+
+go 1.23
+-- main.go --
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"reflect"
+	"unsafe"
+)
+
+//go:linkname typelinks reflect.typelinks
+func typelinks() ([]unsafe.Pointer, [][]int32)
+
+// typeAt makes a reflect.Type from a type descriptor of the binary.
+func typeAt(p unsafe.Pointer) reflect.Type {
+	var i any
+	(*[2]unsafe.Pointer)(unsafe.Pointer(&i))[0] = p
+	return reflect.TypeOf(i)
+}
+
+type ReflectedPath string
+
+type Reflected struct {
+	Name  string
+	Paths []ReflectedPath
+}
+
+func main() {
+	var r Reflected
+	json.Unmarshal([]byte(`{"Name":"x","Paths":["a"]}`), &r)
+
+	// reflect finds the types it can construct, such as []T for SliceOf,
+	// by a binary search over the typelinks.
+	sections, offsets := typelinks()
+	missing := 0
+	for m, offs := range offsets {
+		types := make([]reflect.Type, len(offs))
+		for k, off := range offs {
+			types[k] = typeAt(unsafe.Add(sections[m], off))
+		}
+		for _, t := range types {
+			s := t.String()
+			i, j := 0, len(types)
+			for i < j {
+				h := int(uint(i+j) >> 1)
+				if types[h].String() < s {
+					i = h + 1
+				} else {
+					j = h
+				}
+			}
+			found := false
+			for ; i < len(types) && types[i].String() == s; i++ {
+				found = found || types[i] == t
+			}
+			if !found {
+				missing++
+			}
+		}
+	}
+	fmt.Println("typelinks not found by reflect:", missing)
+
+	slice := reflect.MakeSlice(reflect.SliceOf(reflect.TypeOf(ReflectedPath(""))), 0, 0).Interface()
+	_, ok := slice.([]ReflectedPath)
+	fmt.Println("SliceOf gives the static type:", ok)
+	if missing > 0 || !ok {
+		os.Exit(1)
+	}
+}
